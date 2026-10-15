@@ -50,6 +50,10 @@ class XianyuSearcher:
         self.user_id = "default"  # 默认用户ID
         # 是否已占用浏览器槽位，避免重复获取或漏还
         self._browser_slot_held = False
+        # 【新增】风控信号位：on_response 一旦捕获到 initSuccess / punishTextFetch 这类
+        # "NC 滑块已经初始化"的上报，就置 True。handle_slider_verification 会
+        # 用这个标志覆盖 DOM 异步注入未完成的场景，避免漏检。
+        self._risk_signal_detected = False
 
     async def _handle_scratch_captcha_manual(self, page, max_retries=3, wait_for_completion=True):
         """人工处理刮刮乐滑块（远程控制 + 截图备份）
@@ -424,15 +428,23 @@ class XianyuSearcher:
             bool: True表示成功（包括没有滑块或滑块验证成功），False表示失败
         """
         try:
-            # 等待页面加载滑块元素（优化等待时间）
-            await asyncio.sleep(1)
+            # 【修复】阿里新版 NC 滑块是异步注入的，原本只 sleep 1 秒经常错过渲染时机。
+            # 拉到 3 秒，确保 DOM 已经渲染完；同时把"风控信号位"提前到这里——
+            # on_response 已经在 goto 之前就注册了，所以 sleep 期间如果 initSuccess 上报
+            # 到达，self._risk_signal_detected 会被置 True。
+            await asyncio.sleep(3)
             logger.info("🔍 开始检测滑块验证...")
-            
+
             # 使用传入的对象或实例属性
             context = context or self.context
             browser = browser or self.browser
             playwright = playwright or getattr(self, 'playwright', None)
-            
+
+            # 【修复】如果 on_response 捕获到风控信号（initSuccess / punishTextFetch），
+            # 强制进入滑块处理流程，不再依赖 DOM 是否渲染完。这是修复"风控已下发但
+            # handle_slider_verification 漏检"这个老 bug 的关键。
+            risk_signal = getattr(self, '_risk_signal_detected', False)
+
             # 【调试】打印页面HTML内容，查找滑块相关关键词
             try:
                 page_content = await page.content()
@@ -448,7 +460,7 @@ class XianyuSearcher:
                     logger.info("✅ 页面HTML中未发现滑块关键词")
             except Exception as e:
                 logger.debug(f"检查页面内容时出错: {e}")
-            
+
             # 检测滑块元素（支持多种类型的滑块）
             slider_selectors = [
                 # 阿里云盾 nc 系列滑块
@@ -472,11 +484,11 @@ class XianyuSearcher:
                 '[class*="captcha"]',
                 '[id*="captcha"]'
             ]
-            
+
             has_slider = False
             detected_selector = None
             found_elements = []
-            
+
             for selector in slider_selectors:
                 try:
                     element = await page.query_selector(selector)
@@ -492,7 +504,7 @@ class XianyuSearcher:
                 except Exception as e:
                     logger.debug(f"选择器 {selector} 检测出错: {e}")
                     continue
-            
+
             # 输出调试信息
             if found_elements:
                 logger.warning(f"🔍 找到以下滑块元素（但可能不可见）: {', '.join(found_elements)}")
@@ -503,6 +515,18 @@ class XianyuSearcher:
                     detected_selector = found_elements[0]
             else:
                 logger.debug("未找到任何滑块选择器匹配的元素")
+
+            # 【修复】风控信号位覆盖：哪怕 DOM / iframe 一个滑块元素都没命中，
+            # 只要 initSuccess / punishTextFetch 上报出现过，就视为有滑块。
+            # 此时 selector 选最常见的 NC 容器，让后续 XianyuSliderStealth 接管。
+            # 这个判断放在所有 DOM 检测之后，确保不会误覆盖已命中的 has_slider。
+            if not has_slider and risk_signal:
+                logger.warning(
+                    "🛡️ 风控信号位已置位，但 DOM/iframe 均未命中滑块元素；"
+                    "强制按 '有滑块' 处理，走 NC 自动处理/人工通道"
+                )
+                has_slider = True
+                detected_selector = '#nc_1_n1z'
             
             # 【额外检测】检查 iframe 中的滑块
             if not has_slider:
@@ -696,12 +720,19 @@ class XianyuSearcher:
                 self._browser_slot_held = True
 
             playwright = await async_playwright().start()
-            
-            # 设置持久化数据目录（保存缓存、cookies等）
+
+            # 【修复】持久化目录按进程隔离，避免 LocalStorage 中残留的 x5sec/_m_h5_tk
+            # 把同一个搜索会话钉在风控黑名单里。原先所有搜索复用
+            # $TMP/xianyu_browser_cache，结果就是"带病上岗"——第一次 shade 接口被风控标
+            # 记后，后续 pc.search 接口 100% 被下发 initSuccess 滑块。
+            # 这里改成 $TMP/xianyu_browser_cache_<pid>_<ts>，每次进程启动一次新会话。
             import tempfile
-            user_data_dir = os.path.join(tempfile.gettempdir(), 'xianyu_browser_cache')
+            user_data_dir = os.path.join(
+                tempfile.gettempdir(),
+                f'xianyu_browser_cache_{os.getpid()}_{int(datetime.now().timestamp())}'
+            )
             os.makedirs(user_data_dir, exist_ok=True)
-            logger.info(f"使用持久化数据目录（保留缓存）: {user_data_dir}")
+            logger.info(f"使用持久化数据目录（按进程隔离）: {user_data_dir}")
             
             # 简化的浏览器启动参数，避免冲突
             browser_args = [
@@ -804,10 +835,25 @@ class XianyuSearcher:
             # 清空之前的API响应
             self.api_responses = []
             data_list = []
+            # 【修复】重置风控信号位，避免上一次会话残留影响本次判定
+            self._risk_signal_detected = False
 
             # 设置API响应监听器
             async def on_response(response):
                 """处理API响应，解析数据"""
+                # 【新增】识别阿里风控"滑块已初始化"信号。
+                # 这两类请求一旦出现，就意味着 NC 滑块组件已经在内存里渲染完成，
+                # 只是当前 DOM 查询时机过早/过晚没看到。后续 handle_slider_verification
+                # 会用这个信号强制走"有滑块"分支，不会再误判为无。
+                if "_____tmd_____/punishTextFetch" in response.url or \
+                   ("_____tmd_____/report" in response.url and "type=initSuccess" in response.url):
+                    self._risk_signal_detected = True
+                    logger.warning(
+                        f"🛡️ 检测到风控信号: {response.url[:120]}... "
+                        f"将强制进入滑块处理流程"
+                    )
+                    return
+
                 if "h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search" in response.url:
                     try:
                         # 检查响应状态
@@ -849,8 +895,18 @@ class XianyuSearcher:
 
                 logger.info(f"使用账户: {cookie_data.get('id', 'unknown')}")
 
+                # 【修复】on_response 必须在 page.goto 之前注册。
+                # 原代码在 fill 搜索框之后才注册，会漏掉：
+                #   - 闲鱼首页打开时的 shade 联想接口
+                #   - 搜索框聚焦触发的补全请求
+                #   - goto 加载期间的所有 mtop 上报
+                # 这些漏掉的 shade 接口恰恰是"第一次成功"的来源，
+                # 但它返回的 resultList 是空（联想词不是真搜索结果）。
+                self.page.on("response", on_response)
+
                 logger.info("正在访问闲鱼首页...")
-                await self.page.goto("https://www.goofish.com", timeout=30000)
+                # 60s：闲鱼首页本身加载就要 10-20s，cookie 失效时风控页可达 30s+
+                await self.page.goto("https://www.goofish.com", timeout=60000)
 
                 # 设置cookies进行登录
                 logger.info("正在设置cookies进行登录...")
@@ -862,16 +918,16 @@ class XianyuSearcher:
                     # 刷新页面以应用cookies
                     await self.page.reload()
                     await asyncio.sleep(2)
-               
-                    
 
-                await self.page.wait_for_load_state("networkidle", timeout=10000)
+
+
+                # 30s：reload 后 networkidle 也要慢
+                await self.page.wait_for_load_state("networkidle", timeout=30000)
 
                 logger.info(f"正在搜索关键词: {keyword}")
                 await self.page.fill('input[class*="search-input"]', keyword)
 
-                # 注册响应监听
-                self.page.on("response", on_response)
+                # on_response 已在 page.goto 之前注册（见上方）
 
                 await self.page.click('button[type="submit"]')
                                   
@@ -1210,9 +1266,30 @@ class XianyuSearcher:
             all_data_list = []
 
             # 设置API响应监听器
+            # 【诊断日志】多页搜索现在第 1 页拿不到数据，先把所有可疑的 URL 都打出来
+            self._diag_response_count = 0
+            # 【新增】风控拦截标志位。阿里风控会在搜索接口响应里下发
+            # _____tmd_____/punishTextFetch 或 cf.aliyun.com/nocaptcha 这种子请求，
+            # 这种情况下 resultList 一定是空的（=0 条），但前端不应该只看到 "0 条"，
+            # 而应该知道"被风控拦截了，需要人工验证"——否则用户会以为代码坏了。
+            self._is_risk_blocked = False
+
             async def on_response(response):
                 """处理API响应，解析数据"""
-                if "h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search" in response.url:
+                url = response.url
+                self._diag_response_count += 1
+                # 每 50 个响应打个总数，避免日志刷屏
+                if self._diag_response_count % 50 == 1:
+                    logger.info(f"[诊断] on_response 已触发 {self._diag_response_count} 次")
+                # 命中搜索关键词的请求单独打——找到真正的 API 路径
+                if "search" in url.lower() and "goofish" in url.lower():
+                    logger.info(f"[诊断] 疑似搜索 API: status={response.status} url={url[:200]}")
+                # 【新增】检测风控拦截信号：阿里会在搜索接口响应里带这些路径
+                if "_____tmd_____/" in url or "cf.aliyun.com/nocaptcha" in url:
+                    self._is_risk_blocked = True
+                    logger.warning(f"[诊断] 检测到风控拦截信号: {url[:200]}")
+                    return
+                if "h5api.m.goofish.com/h5/mtop.taobao.idlemtopsearch.pc.search" in url:
                     try:
                         # 检查响应状态
                         if response.status != 200:
@@ -1258,7 +1335,8 @@ class XianyuSearcher:
                 logger.info(f"使用账户: {cookie_data.get('id', 'unknown')}")
 
                 logger.info("正在访问闲鱼首页...")
-                await self.page.goto("https://www.goofish.com", timeout=30000)
+                # 60s：闲鱼首页本身加载就要 10-20s，cookie 失效时风控页可达 30s+
+                await self.page.goto("https://www.goofish.com", timeout=60000)
 
                 # 设置cookies进行登录
                 logger.info("正在设置cookies进行登录...")
@@ -1276,7 +1354,8 @@ class XianyuSearcher:
                     raise Exception("页面在导航后被关闭")
 
                 logger.info("等待页面加载完成...")
-                await self.page.wait_for_load_state("networkidle", timeout=15000)
+                # 30s：多页搜索首页 networkidle 比单页慢
+                await self.page.wait_for_load_state("networkidle", timeout=30000)
 
                 # 等待页面稳定
                 logger.info("等待页面稳定...")
@@ -1365,6 +1444,12 @@ class XianyuSearcher:
                 await asyncio.sleep(3)
 
                 first_page_count = len(all_data_list)
+                # 【诊断】第 1 页真正拿到的数据量——这一行永远应该出现，0 条就直接告诉原因
+                logger.info(
+                    f"[诊断] 第1页结束: api_responses={len(self.api_responses)} "
+                    f"all_data_list={first_page_count} diag_count={self._diag_response_count} "
+                    f"is_risk_blocked={self._is_risk_blocked}"
+                )
                 logger.info(f"第1页完成，获取到 {first_page_count} 条数据")
 
                 # 如果需要获取更多页数据
@@ -1393,6 +1478,8 @@ class XianyuSearcher:
                                 next_button = self.page.locator(selector).first
 
                                 if await next_button.is_visible(timeout=3000):
+                                    # 【诊断】每个能"看到"的选择器都打出来
+                                    logger.info(f"[诊断] 第 {page_num} 页候选 selector 可见: {selector}")
                                     # 检查按钮是否可点击
                                     is_disabled = await next_button.get_attribute("disabled")
                                     has_disabled_class = await next_button.evaluate("el => el.classList.contains('ant-pagination-disabled') || el.classList.contains('disabled')")
@@ -1438,12 +1525,22 @@ class XianyuSearcher:
                 total_count = len(all_data_list)
                 logger.info(f"多页搜索完成，总共获取到 {total_count} 条真实数据，已按想要人数排序")
 
-                return {
+                # 【新增】如果触发风控拦截且 0 条结果，把真实原因告诉调用方，而不是悄悄返 0 条
+                error_msg = None
+                if total_count == 0 and getattr(self, '_is_risk_blocked', False):
+                    error_msg = "搜索被闲鱼风控拦截，需要人工完成滑块验证。请等待 5-10 分钟后重试，或在 Cookie 管理中刷新登录态后通过「人工滑块」通道手动验证一次。"
+                    logger.warning(f"[诊断] 多页搜索触发风控拦截且 0 条结果，返回明确错误")
+
+                return_dict = {
                     'items': all_data_list,
                     'total': total_count,
                     'is_real_data': True,
-                    'source': 'playwright'
+                    'source': 'playwright',
+                    'is_risk_blocked': getattr(self, '_is_risk_blocked', False),
                 }
+                if error_msg:
+                    return_dict['error'] = error_msg
+                return return_dict
 
             finally:
                 # 确保浏览器被正确关闭
@@ -1546,10 +1643,36 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
             logger.info(f"开始单页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
             result = await searcher.search_items(keyword, page, page_size)
 
-            # 如果成功获取到数据，直接返回
-            if result.get('items') or not result.get('error'):
-                logger.info(f"单页搜索成功，获取到 {len(result.get('items', []))} 条数据")
+            # 【修复】成功条件：必须真的拿到商品数据才认为成功。
+            # 原条件 `if result.get('items') or not result.get('error')` 会让
+            # 风控场景（items=[], error=None）被当作成功，导致前端永远看不到错误提示、
+            # 也无法触发重试或人工滑块流程。
+            items = result.get('items') or []
+            error = result.get('error')
+            if items or error:
+                logger.info(f"单页搜索成功，获取到 {len(items)} 条数据")
                 return result
+
+            # 【修复】items=[] 且 error=None 意味着"疑似风控/滑块"。
+            # 原代码把这种情况当作成功直接返回，导致前端永远拿到空数据
+            # 且不会触发人工滑块流程。这里显式抛异常走重试路径，
+            # 用 retry_delay 把重试节奏拉慢，避免被风控认定为"高频自动化"。
+            logger.warning(
+                f"单页搜索返回 0 条数据且无 error 字段，疑似被风控/静默滑块拦截 "
+                f"(尝试 {attempt + 1}/{max_retries + 1})"
+            )
+            if attempt == max_retries:
+                return {
+                    'items': [],
+                    'total': 0,
+                    'error': (
+                        "搜索返回 0 条数据，可能被闲鱼风控拦截或触发了静默滑块。"
+                        "请尝试: 1) 等待几分钟后重试 2) 在 Cookie 管理中刷新登录态 "
+                        "3) 通过 '人工滑块' 通道手动验证一次"
+                    )
+                }
+            logger.info(f"等待 {retry_delay} 秒后重试...")
+            await asyncio.sleep(retry_delay)
 
         except Exception as e:
             error_msg = str(e)
@@ -1575,11 +1698,13 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
                 except Exception as close_error:
                     logger.warning(f"关闭搜索器时出错: {str(close_error)}")
 
-    # 理论上不会到达这里
+    # 理论上不会到达这里 —— 真到了说明 for 循环里 try/except 没拦住
+    # (比如 KeyboardInterrupt 之类的 BaseException)，把异常原文带上方便排查
+    logger.error(f"search_multiple_pages_xianyu 兜底返回: 关键词='{keyword}', total_pages={total_pages}")
     return {
         'items': [],
         'total': 0,
-        'error': "未知错误"
+        'error': "未知错误：搜索循环提前退出（请查看上方日志）"
     }
 
 
@@ -1606,10 +1731,13 @@ async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Di
             logger.info(f"开始多页搜索，尝试次数: {attempt + 1}/{max_retries + 1}")
             result = await searcher.search_multiple_pages(keyword, total_pages)
 
-            # 如果成功获取到数据，直接返回
-            if result.get('items') or not result.get('error'):
-                logger.info(f"多页搜索成功，获取到 {len(result.get('items', []))} 条数据")
-                return result
+            # 【修复】search_multiple_pages 内部已经把异常吃了，只有抛异常才会走到 except 分支。
+            # 所以这里只要拿到 result 就直接 return，不要再用 "items or error" 当成功判定——
+            # 那个判定会导致「搜到 0 条 + 无 error 字段」时落进函数末尾的 "未知错误" 兜底，
+            # 把正常空结果误报成错误（实测 bug：单页 OK，多页返回 "未知错误"）。
+            items = result.get('items') or []
+            logger.info(f"多页搜索完成，获取到 {len(items)} 条数据")
+            return result
 
         except Exception as e:
             error_msg = str(e)
@@ -1635,11 +1763,13 @@ async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Di
                 except Exception as close_error:
                     logger.warning(f"关闭搜索器时出错: {str(close_error)}")
 
-    # 理论上不会到达这里
+    # 理论上不会到达这里 —— 真到了说明 for 循环里 try/except 没拦住
+    # (比如 KeyboardInterrupt 之类的 BaseException)，把异常原文带上方便排查
+    logger.error(f"search_multiple_pages_xianyu 兜底返回: 关键词='{keyword}', total_pages={total_pages}")
     return {
         'items': [],
         'total': 0,
-        'error': "未知错误"
+        'error': "未知错误：搜索循环提前退出（请查看上方日志）"
     }
 
 

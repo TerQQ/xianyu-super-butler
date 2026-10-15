@@ -6153,7 +6153,8 @@ async def search_multiple_pages(
             "keyword": search_request.keyword,
             "is_real_data": result.get("is_real_data", False),
             "is_fallback": result.get("is_fallback", False),
-            "source": result.get("source", "unknown")
+            "source": result.get("source", "unknown"),
+            "is_risk_blocked": result.get("is_risk_blocked", False),
         }
 
         # 如果有错误信息，也包含在响应中
@@ -6164,7 +6165,7 @@ async def search_multiple_pages(
 
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"{user_info} 多页商品搜索失败: {error_msg}")
+        logger.exception(f"{user_info} 多页商品搜索失败: {error_msg}")  # logger.exception 带完整堆栈
         raise HTTPException(status_code=500, detail=f"多页商品搜索失败: {error_msg}")
 
 

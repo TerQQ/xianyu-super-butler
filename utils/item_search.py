@@ -7,6 +7,11 @@
 import asyncio
 import sys
 import os
+import re
+import shutil
+import tempfile
+import threading
+import time
 from datetime import datetime
 from typing import Dict, Any, Optional
 from loguru import logger
@@ -39,6 +44,186 @@ except ImportError:
     logger.warning("Playwright 未安装，将使用模拟数据")
 
 
+# --- 浏览器 profile 目录池 ---------------------------------------------------
+#
+# 闲鱼风控会盯着浏览器身份看，所以 profile 目录既不能每次都换，也不能一直不换：
+#
+# - 每次搜索都新建目录 → 每次都是一个没有历史的全新浏览器，这恰恰是最像机器人
+#   的形态，等于反复试探；
+# - 永久复用同一个目录 → 一旦某次被标记，x5sec 这类状态会一直带下去，就是之前
+#   "带病上岗"的老问题。
+#
+# 折中是：固定几个目录循环复用（有历史、像正常用户），超过 TTL 再重建一次身份。
+#
+# 目录必须独占：Chromium 的 persistent context 对同一个 user_data_dir 会拿
+# SingletonLock，两个浏览器撞上同一个目录会直接启动失败。这里用 flock 做跨进程
+# 互斥，同进程内的并发搜索、以及误起的第二个 Start.py 实例都能挡住。
+_PROFILE_NAME = 'xianyu_browser_cache_slot'
+_PROFILE_SLOT_COUNT = 8
+# 复用多久之后重建一次身份。默认 6 小时，可用环境变量覆盖。
+_PROFILE_TTL = int(os.getenv('XIANYU_PROFILE_TTL', 6 * 3600))
+
+try:
+    import fcntl
+    _HAVE_FCNTL = True
+except ImportError:  # Windows
+    _HAVE_FCNTL = False
+    logger.warning("当前平台没有 fcntl，浏览器 profile 只做进程内互斥")
+
+_sweep_done = False
+_sweep_lock = threading.Lock()
+
+
+class _ProfileLease:
+    """一个 profile 目录的独占租约。释放之前别的搜索拿不到同一个目录。"""
+
+    def __init__(self, path: str, lock_fd: int, slot: int):
+        self.path = path
+        self.slot = slot
+        self._lock_fd = lock_fd
+
+    def release(self) -> None:
+        """归还目录。重复调用是安全的。"""
+        if self._lock_fd is None:
+            return
+        fd, self._lock_fd = self._lock_fd, None
+        if _HAVE_FCNTL:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def _profile_base_dir() -> str:
+    return tempfile.gettempdir()
+
+
+def _try_lock_profile(path: str) -> Optional[int]:
+    """尝试独占 path 的锁文件。成功返回 fd，被别人占着返回 None。"""
+    lock_path = f"{path}.lock"
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError as e:
+        logger.debug(f"打开 profile 锁文件失败 {lock_path}: {e}")
+        return None
+    if not _HAVE_FCNTL:
+        return fd
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def _rotate_profile_if_stale(path: str) -> None:
+    """目录用超 TTL 就整个删掉重建，相当于换一次浏览器身份。"""
+    try:
+        age = time.time() - os.path.getmtime(path)
+    except OSError:
+        return
+    if age < _PROFILE_TTL:
+        return
+    logger.info(f"浏览器 profile 已使用 {age / 3600:.1f} 小时，重建以轮换身份: {path}")
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+# 早期版本一次性目录的形状：xianyu_browser_cache_<pid>_<时间戳>。
+# 必须精确匹配——用 startswith 会把本模块新起的 fallback 目录也算进去，
+# 那可能是另一个活着的进程正在用的目录。
+_LEGACY_PID_DIR_RE = re.compile(r'^xianyu_browser_cache_(\d+)_\d+$')
+
+
+def _sweep_legacy_profiles(base: str) -> None:
+    """清掉早期版本留下的一次性 profile 目录。活着的进程正在用的会跳过。
+
+    只认 <pid>_<时间戳> 这一种形状；其余名字一律不碰——宁可有目录留着，
+    也不要删掉别人正在用的。老的全局共享目录也不动（老代码不加锁，
+    没有可靠办法判断它是否在用）。
+    """
+    removed = 0
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return
+    for name in names:
+        matched = _LEGACY_PID_DIR_RE.match(name)
+        if not matched:
+            continue
+        pid = int(matched.group(1))
+        if _pid_alive(pid):
+            # 含本进程：降级目录可能正被自己用着，一并跳过。
+            # 等这个 pid 消失，下次启动自然会扫掉。
+            continue
+        path = os.path.join(base, name)
+        if not os.path.isdir(path):
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        removed += 1
+    if removed:
+        logger.info(f"已清理 {removed} 个遗留的浏览器 profile 目录")
+
+
+def _sweep_stale_profiles_once(base: str) -> None:
+    """整个进程只扫一次，避免每次搜索都翻目录。"""
+    global _sweep_done
+    with _sweep_lock:
+        if _sweep_done:
+            return
+        _sweep_done = True
+    try:
+        _sweep_legacy_profiles(base)
+    except Exception as e:
+        logger.debug(f"清理遗留 profile 目录时出错: {e}")
+
+
+def acquire_profile_dir():
+    """取一个独占的浏览器 profile 目录。
+
+    返回 (路径, 租约)；槽位全被占满时返回 (None, None)，调用方自行降级。
+    """
+    base = _profile_base_dir()
+    _sweep_stale_profiles_once(base)
+
+    for slot in range(_PROFILE_SLOT_COUNT):
+        path = os.path.join(base, f'{_PROFILE_NAME}{slot}')
+        fd = _try_lock_profile(path)
+        if fd is None:
+            continue
+        try:
+            if os.path.isdir(path):
+                _rotate_profile_if_stale(path)
+            os.makedirs(path, exist_ok=True)
+        except Exception as e:
+            logger.warning(f"准备 profile 目录失败 {path}: {e}")
+            os.close(fd)
+            continue
+        logger.info(f"复用浏览器 profile 槽位 {slot}: {path}")
+        return path, _ProfileLease(path, fd, slot)
+
+    logger.warning(
+        f"{_PROFILE_SLOT_COUNT} 个浏览器 profile 槽位都被占用，"
+        "可能有一批搜索卡住没释放"
+    )
+    return None, None
+
+
 class XianyuSearcher:
     """闲鱼商品搜索器 - 基于 Playwright"""
 
@@ -50,6 +235,8 @@ class XianyuSearcher:
         self.user_id = "default"  # 默认用户ID
         # 是否已占用浏览器槽位，避免重复获取或漏还
         self._browser_slot_held = False
+        # 当前持有的浏览器 profile 目录租约，close_browser 时归还
+        self._profile_lease: Optional[_ProfileLease] = None
         # 【新增】风控信号位：on_response 一旦捕获到 initSuccess / punishTextFetch 这类
         # "NC 滑块已经初始化"的上报，就置 True。handle_slider_verification 会
         # 用这个标志覆盖 DOM 异步注入未完成的场景，避免漏检。
@@ -721,18 +908,19 @@ class XianyuSearcher:
 
             playwright = await async_playwright().start()
 
-            # 【修复】持久化目录按进程隔离，避免 LocalStorage 中残留的 x5sec/_m_h5_tk
-            # 把同一个搜索会话钉在风控黑名单里。原先所有搜索复用
-            # $TMP/xianyu_browser_cache，结果就是"带病上岗"——第一次 shade 接口被风控标
-            # 记后，后续 pc.search 接口 100% 被下发 initSuccess 滑块。
-            # 这里改成 $TMP/xianyu_browser_cache_<pid>_<ts>，每次进程启动一次新会话。
-            import tempfile
-            user_data_dir = os.path.join(
-                tempfile.gettempdir(),
-                f'xianyu_browser_cache_{os.getpid()}_{int(datetime.now().timestamp())}'
-            )
-            os.makedirs(user_data_dir, exist_ok=True)
-            logger.info(f"使用持久化数据目录（按进程隔离）: {user_data_dir}")
+            # 复用一个固定槽位的 profile 目录，而不是每次搜索都新建：全新目录
+            # 等于一个没有历史的浏览器身份，对风控来说反而更可疑。超过
+            # _PROFILE_TTL 才会重建一次。取不到槽位时退化成一次性目录，
+            # 宁可多换一次身份，也不要让搜索直接失败。
+            user_data_dir, lease = acquire_profile_dir()
+            if user_data_dir is None:
+                user_data_dir = os.path.join(
+                    tempfile.gettempdir(),
+                    f'xianyu_browser_cache_fallback_{os.getpid()}_{int(time.time())}'
+                )
+                os.makedirs(user_data_dir, exist_ok=True)
+                logger.warning(f"降级使用一次性 profile 目录: {user_data_dir}")
+            self._profile_lease = lease
             
             # 简化的浏览器启动参数，避免冲突
             browser_args = [
@@ -760,21 +948,31 @@ class XianyuSearcher:
             
             # 使用 launch_persistent_context 实现跨会话的缓存持久化
             # 这样通过一次滑块验证后，下次搜索可以复用缓存，避免再次出现滑块
-            self.context = await playwright.chromium.launch_persistent_context(
-                user_data_dir,  # 第一个参数是用户数据目录，用于持久化
-                headless=True,  # 无头模式，后台运行
-                args=browser_args,
-                user_agent=CHROME_UA,
-                viewport={'width': 1280, 'height': 720},
-                locale='zh-CN',  # 设置语言为中文
-                # 持久化上下文会自动保存和加载：
-                # - Cookies
-                # - 缓存
-                # - LocalStorage
-                # - SessionStorage
-                # - 其他浏览器状态
-            )
-            
+            try:
+                self.context = await playwright.chromium.launch_persistent_context(
+                    user_data_dir,  # 第一个参数是用户数据目录，用于持久化
+                    headless=True,  # 无头模式，后台运行
+                    args=browser_args,
+                    user_agent=CHROME_UA,
+                    viewport={'width': 1280, 'height': 720},
+                    locale='zh-CN',  # 设置语言为中文
+                    # 持久化上下文会自动保存和加载：
+                    # - Cookies
+                    # - 缓存
+                    # - LocalStorage
+                    # - SessionStorage
+                    # - 其他浏览器状态
+                )
+            except Exception:
+                # 启动失败就别攥着槽位和租约，否则后面的搜索全在排队等
+                if self._profile_lease is not None:
+                    self._profile_lease.release()
+                    self._profile_lease = None
+                if self._browser_slot_held:
+                    self._browser_slot_held = False
+                    browser_limit.release_slot("商品搜索")
+                raise
+
             # launch_persistent_context 返回的是 context，不是 browser
             # 需要通过 context.browser 获取 browser 对象
             self.browser = self.context.browser
@@ -803,6 +1001,11 @@ class XianyuSearcher:
         except Exception as e:
             logger.warning(f"关闭商品搜索器浏览器时出错: {e}")
         finally:
+            # 租约必须在浏览器真的关掉之后再还，否则下一个搜索会拿到一个
+            # 还被 Chromium 占着的目录，直接撞 SingletonLock。
+            if self._profile_lease is not None:
+                self._profile_lease.release()
+                self._profile_lease = None
             if self._browser_slot_held:
                 self._browser_slot_held = False
                 browser_limit.release_slot("商品搜索")

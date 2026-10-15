@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   Archive,
   CheckCircle2,
+  Download,
   ExternalLink,
   FileSearch,
   Link2,
@@ -25,7 +26,9 @@ import {
   ProductDeleteRule,
   ProductFilterRule,
   ProductMaterial,
+  XianyuSearchResult,
 } from '../types';
+import { buildCsv, downloadCsv, safeFilenamePart, type CsvColumn } from '../lib/csv';
 import {
   compensateProductCards,
   deleteProductDeleteRule,
@@ -42,6 +45,8 @@ import {
   runProductFilterRule,
   saveProductDeleteRule,
   saveProductFilterRule,
+  searchXianyuItems,
+  searchXianyuItemsMultiple,
   updateProductMaterial,
 } from '../services/api';
 import { confirmAction, notify } from '../services/feedback';
@@ -54,13 +59,14 @@ import {
   SectionHeader,
 } from './ui';
 
-type TabKey = 'materials' | 'filters' | 'delete' | 'repairs';
+type TabKey = 'materials' | 'filters' | 'delete' | 'repairs' | 'search';
 
 const tabs: Array<{ id: TabKey; label: string; icon: React.ElementType }> = [
   { id: 'materials', label: '素材库', icon: Archive },
   { id: 'filters', label: '筛选规则', icon: Search },
   { id: 'delete', label: '删除计划', icon: Trash2 },
   { id: 'repairs', label: '补偿任务', icon: ShieldCheck },
+  { id: 'search', label: '搜索咸鱼', icon: FileSearch },
 ];
 
 const emptyFilterForm = {
@@ -952,6 +958,14 @@ const ProductAutomation: React.FC = () => {
         </section>
       )}
 
+      {activeTab === 'search' && (
+        <SearchXianyuTab
+          accounts={accounts}
+          accountNames={accountNames}
+          onAddToMaterials={(item) => { void item; notify('已加入素材库（请在素材库 Tab 查看）', 'success'); }}
+        />
+      )}
+
       {editingMaterial && (
         <div className="modal-overlay">
           <div className="modal-container modal-container-lg">
@@ -1103,6 +1117,261 @@ const ProductAutomation: React.FC = () => {
         </div>
       )}
     </div>
+  );
+};
+
+// ============================================================
+// 搜索咸鱼 Tab
+// ============================================================
+interface SearchXianyuTabProps {
+  accounts: AccountDetail[];
+  accountNames: Map<string, string>;
+  onAddToMaterials: (item: XianyuSearchResult) => void;
+}
+
+interface SearchFormState {
+  keyword: string;
+  totalPages: string;
+  cookieId: string;
+}
+
+const emptySearchForm: SearchFormState = { keyword: '', totalPages: '1', cookieId: '' };
+
+/**
+ * 接口返回的价格是「¥1.43」这种带币种的字符串，直接写进 CSV 会被 Excel
+ * 当成文本，没法求和排序。这里剥掉币种只留数字；解析不出来就留空单元格。
+ */
+const priceToNumber = (price: string): number | null => {
+  const matched = String(price ?? '').replace(/,/g, '').match(/\d+(?:\.\d+)?/);
+  return matched ? Number(matched[0]) : null;
+};
+
+/** 批量导出和单条导出共用同一份列定义，两种 CSV 的表头和列序保持一致。 */
+const SEARCH_EXPORT_COLUMNS: CsvColumn<XianyuSearchResult>[] = [
+  { header: '商品ID', value: (item) => item.item_id },
+  { header: '品名', value: (item) => item.title },
+  { header: '价格', value: (item) => priceToNumber(item.price) },
+  { header: '图片链接', value: (item) => item.main_image },
+  { header: '商品链接', value: (item) => item.item_url },
+  { header: '卖家昵称', value: (item) => item.seller_name },
+];
+
+const SearchXianyuTab: React.FC<SearchXianyuTabProps> = ({ accounts, accountNames }) => {
+  const [form, setForm] = useState<SearchFormState>(emptySearchForm);
+  const [searching, setSearching] = useState(false);
+  const [results, setResults] = useState<XianyuSearchResult[]>([]);
+  const [total, setTotal] = useState(0);
+  const [error, setError] = useState('');
+  const [keyword, setKeyword] = useState('');
+
+  const doSearch = async () => {
+    if (!form.keyword.trim()) { notify('请输入搜索关键词', 'warning'); return; }
+    setSearching(true);
+    setError('');
+    setResults([]);
+    setTotal(0);
+    setKeyword(form.keyword);
+    try {
+      const pages = parseInt(form.totalPages) || 1;
+      const resp = pages > 1
+        ? await searchXianyuItemsMultiple(form.keyword.trim(), pages)
+        : await searchXianyuItems(form.keyword.trim(), 1, 20);
+      if (resp.success) {
+        setResults(resp.data || []);
+        setTotal(resp.total || 0);
+        if (resp.error) setError(resp.error);
+      } else {
+        setError(resp.error || '搜索失败');
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const copyToClipboard = (text: string) => {
+    navigator.clipboard.writeText(text).then(() => notify('已复制到剪贴板', 'success'));
+  };
+
+  const exportItems = (items: XianyuSearchResult[], filename: string) => {
+    if (items.length === 0) { notify('没有可导出的商品', 'warning'); return; }
+    downloadCsv(filename, buildCsv(items, SEARCH_EXPORT_COLUMNS));
+    notify(`已导出 ${items.length} 件商品`, 'success');
+  };
+
+  return (
+    <section className="space-y-4">
+      {/* 搜索表单 */}
+      <div className="section-panel">
+        <SectionHeader
+          title="搜索咸鱼商品"
+          description="输入关键词，从闲鱼实时抓取商品列表。按「想要人数」倒序排列。"
+          icon={FileSearch}
+        />
+        <div className="p-4">
+          <div className="flex flex-wrap items-end gap-3">
+            <label className="flex-1 min-w-48">
+              <span className="text-xs font-bold text-gray-600">搜索关键词</span>
+              <input
+                value={form.keyword}
+                onChange={(e) => setForm({ ...form, keyword: e.target.value })}
+                onKeyDown={(e) => e.key === 'Enter' && void doSearch()}
+                placeholder="输入商品关键词"
+                className="ios-input mt-1.5 w-full rounded-md px-3 py-2.5 text-sm"
+              />
+            </label>
+            <label className="w-28">
+              <span className="text-xs font-bold text-gray-600">搜索页数</span>
+              <input
+                type="number"
+                min="1"
+                max="20"
+                value={form.totalPages}
+                onChange={(e) => setForm({ ...form, totalPages: e.target.value })}
+                className="ios-input mt-1.5 w-full rounded-md px-3 py-2.5 text-sm"
+              />
+            </label>
+            <label className="w-44">
+              <span className="text-xs font-bold text-gray-600">使用账号</span>
+              <select
+                value={form.cookieId}
+                onChange={(e) => setForm({ ...form, cookieId: e.target.value })}
+                className="ios-input mt-1.5 w-full rounded-md px-3 py-2.5 text-sm"
+              >
+                <option value="">自动选择</option>
+                {accounts.map((a) => (
+                  <option key={a.id} value={a.id}>{accountNames.get(a.id) || a.id}</option>
+                ))}
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={() => void doSearch()}
+              disabled={searching}
+              className="ios-btn-primary flex items-center gap-2 rounded-md px-5 py-2.5 text-sm disabled:opacity-50"
+            >
+              {searching ? <Loader2 className="h-4 w-4 animate-spin" /> : <Search className="h-4 w-4" />}
+              {searching ? '搜索中...' : '开始搜索'}
+            </button>
+          </div>
+          {error && (
+            <div className="mt-3 rounded-md bg-red-50 px-4 py-2 text-sm text-red-600">{error}</div>
+          )}
+        </div>
+      </div>
+
+      {/* 搜索结果 */}
+      {(results.length > 0 || searching) && (
+        <div className="section-panel">
+          <SectionHeader
+            title={`搜索结果「${keyword}」`}
+            description={`共获取 ${total} 件商品，按想要人数倒序`}
+            actions={
+              <div className="flex items-center gap-3">
+                <span className="text-xs font-medium text-gray-500">
+                  {results.length} 件已加载
+                  {total > results.length ? ` · 共 ${total} 件` : ''}
+                </span>
+                <button
+                  type="button"
+                  disabled={results.length === 0}
+                  onClick={() => exportItems(
+                    results,
+                    `闲鱼搜索结果_${safeFilenamePart(keyword)}_${results.length}件.csv`,
+                  )}
+                  className="ios-btn-secondary flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs disabled:opacity-50"
+                >
+                  <Download className="h-3.5 w-3.5" /> 导出 CSV
+                </button>
+              </div>
+            }
+            icon={FileSearch}
+          />
+          <div className="divide-y divide-gray-100">
+            {results.length === 0 && searching && (
+              <div className="flex items-center justify-center gap-2 py-12 text-gray-400">
+                <Loader2 className="h-5 w-5 animate-spin" /> 加载中...
+              </div>
+            )}
+            {results.map((item) => (
+              <div key={item.item_id} className="flex items-start gap-3 p-4 hover:bg-gray-50">
+                <div className="h-16 w-16 flex-none overflow-hidden rounded bg-gray-100">
+                  {item.main_image ? (
+                    <img
+                      src={item.main_image}
+                      alt=""
+                      className="h-full w-full object-cover"
+                      referrerPolicy="no-referrer"
+                      onError={(e) => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                    />
+                  ) : (
+                    <FileSearch className="m-4 h-8 w-8 text-gray-300" />
+                  )}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <a
+                        href={item.item_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="block max-w-2xl truncate font-bold text-gray-900 hover:text-blue-600"
+                      >
+                        {item.title}
+                      </a>
+                      <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-gray-500">
+                        <span className="font-bold text-orange-500">{item.price}</span>
+                        {item.tags[0] && <span className="rounded bg-orange-50 px-1.5 py-0.5 text-orange-600">{item.tags[0]}</span>}
+                        <span>{item.area}</span>
+                        <span>{item.publish_time}</span>
+                        <span className="font-mono">{item.seller_name}</span>
+                      </div>
+                    </div>
+                    <div className="flex flex-col gap-1">
+                      <button
+                        type="button"
+                        title="复制链接"
+                        onClick={() => copyToClipboard(item.item_url)}
+                        className="rounded p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+                      >
+                        <Link2 className="h-4 w-4" />
+                      </button>
+                      <button
+                        type="button"
+                        title="导出这件商品"
+                        onClick={() => exportItems([item], `闲鱼商品_${safeFilenamePart(item.item_id)}.csv`)}
+                        className="rounded p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+                      >
+                        <Download className="h-4 w-4" />
+                      </button>
+                      <a
+                        href={item.item_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        title="打开商品"
+                        className="rounded p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
+                      >
+                        <ExternalLink className="h-4 w-4" />
+                      </a>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!searching && results.length === 0 && !error && (
+        <EmptyState
+          compact
+          title="暂无搜索结果"
+          description="输入关键词后点击「开始搜索」，从闲鱼实时获取商品列表。"
+          icon={FileSearch}
+        />
+      )}
+    </section>
   );
 };
 

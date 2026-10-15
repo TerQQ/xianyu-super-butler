@@ -11,7 +11,7 @@ import {
   , ChatAccount, ChatConversation, ChatMessage, ProductMaterial,
   ProductFilterRule, ProductDeleteRule, AutomationTaskRun,
   ProductAutomationResult, ProductDeletePreview, QuickPhrase,
-  AnnouncementPayload
+  AnnouncementPayload, XianyuSearchResult
 } from '../types';
 
 // Auth
@@ -716,6 +716,45 @@ export const runProductFilterRule = async (ruleId: number): Promise<ProductAutom
     {},
   );
   return response.data;
+};
+
+// Xianyu Item Search
+export interface SearchItemsResponse {
+  success: boolean;
+  data: XianyuSearchResult[];
+  total: number;
+  page: number;
+  page_size: number;
+  keyword: string;
+  is_real_data: boolean;
+  source: string;
+  error?: string;
+}
+
+export const searchXianyuItems = async (
+  keyword: string,
+  page: number = 1,
+  pageSize: number = 20,
+): Promise<SearchItemsResponse> => {
+  return post<SearchItemsResponse>('/items/search', {
+    keyword,
+    page,
+    page_size: pageSize,
+  });
+};
+
+export const searchXianyuItemsMultiple = async (
+  keyword: string,
+  totalPages: number = 1,
+): Promise<SearchItemsResponse> => {
+  // 闲鱼多页搜索走 Playwright 实际抓取，3 页常见需要 30–60s，
+  // 默认 axios timeout 30s 会让前端先于后端 timeout，导致 Connection Failed-like 现象。
+  // 这里把单接口 timeout 拉到 180s 兜底。
+  return post<SearchItemsResponse>(
+    '/items/search_multiple',
+    { keyword, total_pages: totalPages },
+    { timeout: 180_000 },
+  );
 };
 
 export const getProductDeleteRules = async (): Promise<ProductDeleteRule[]> => {

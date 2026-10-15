@@ -613,6 +613,19 @@ export interface AnnouncementItem {
   published_at: string;
 }
 
+export interface XianyuSearchResult {
+  item_id: string;
+  title: string;
+  price: string;
+  seller_name: string;
+  item_url: string;
+  main_image: string;
+  publish_time: string;
+  tags: string[];
+  area: string;
+  want_count: number;
+}
+
 export interface AnnouncementPayload {
   local_version: string;
   latest_version: string;

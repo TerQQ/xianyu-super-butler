@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Archive,
   CheckCircle2,
@@ -1156,38 +1156,252 @@ const SEARCH_EXPORT_COLUMNS: CsvColumn<XianyuSearchResult>[] = [
   { header: '卖家昵称', value: (item) => item.seller_name },
 ];
 
+// ============================================================
+// 搜索历史缓存（浏览器 localStorage）
+// ============================================================
+//
+// 结果区原先只活在 useState 里，而 SearchXianyuTab 是条件渲染的（见上面
+// `activeTab === 'search' && ...`），所以切一次页签就会卸载重建、结果全丢，
+// 刷新和重启 app 更是必丢。丢一次就得重搜一次，而每次搜索都在消耗风控额度——
+// 缓存的真正价值是省账号风险，不只是省事。
+//
+// key 带版本后缀：将来数据形状变了直接改 key，不做迁移，读到旧 key 只会被
+// 当成「没有缓存」。命名沿用 MessageManagement.tsx 的惯例。
+const SEARCH_CACHE_KEY = 'xianyu-search-cache-v1';
+const MAX_SEARCH_CACHE_ENTRIES = 5;
+
+interface SearchCacheEntry {
+  /** 搜索完成时间（ms）。既是标签行的排序键，也是相对时间的展示源。 */
+  savedAt: number;
+  keyword: string;
+  totalPages: number;
+  cookieId: string;
+  /** 服务端返回的总数，不等于 results.length；结果区「共 N 件」用的是它。 */
+  total: number;
+  results: XianyuSearchResult[];
+  /** 搜索成功但部分分页失败时后端会带 error，恢复时要一起还原。 */
+  warning?: string;
+}
+
+/**
+ * 这几条是渲染路径上的硬依赖：item_id 当 React key，item_url 当 href，
+ * tags 会直接取 [0] 当文案——tags 不是数组的话 `item.tags[0]` 会抛异常。
+ * 其余字段即使缺失也只是渲染成空，不必校验。
+ */
+const isValidCachedItem = (value: unknown): value is XianyuSearchResult => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const item = value as Partial<XianyuSearchResult>;
+  return typeof item.item_id === 'string'
+    && typeof item.item_url === 'string'
+    && typeof item.title === 'string'
+    && Array.isArray(item.tags)
+    && (item.tags.length === 0 || typeof item.tags[0] === 'string');
+};
+
+const loadSearchCache = (): SearchCacheEntry[] => {
+  if (typeof window === 'undefined') return [];
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(SEARCH_CACHE_KEY) || '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((value): value is SearchCacheEntry => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+        const entry = value as Partial<SearchCacheEntry>;
+        return Number.isFinite(entry.savedAt)
+          && typeof entry.keyword === 'string'
+          && entry.keyword.length > 0
+          && Number.isFinite(entry.totalPages)
+          && typeof entry.cookieId === 'string'
+          && Number.isFinite(entry.total)
+          && Array.isArray(entry.results)
+          && entry.results.every(isValidCachedItem);
+      })
+      // 正常写入时本来就是新的在前，这里再排一次：万一被手工改坏，
+      // 不至于把一条很旧的历史当成「最近一次」自动恢复。
+      .sort((left, right) => right.savedAt - left.savedAt)
+      .slice(0, MAX_SEARCH_CACHE_ENTRIES);
+  } catch {
+    return [];
+  }
+};
+
+/** 单次写入。失败返回 false，由调用方决定怎么退让。 */
+const writeSearchCache = (entries: SearchCacheEntry[]): boolean => {
+  if (typeof window === 'undefined') return false;
+  try {
+    window.localStorage.setItem(SEARCH_CACHE_KEY, JSON.stringify(entries));
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const saveSearchCache = (entries: SearchCacheEntry[]) => {
+  if (typeof window === 'undefined') return;
+  const capped = entries.slice(0, MAX_SEARCH_CACHE_ENTRIES);
+  if (writeSearchCache(capped)) return;
+
+  // 配额不足。先把旧值删掉，把这份 key 自己占的字节还回去——否则在
+  // 「旧值尚未被替换」的瞬间，缩减后的新值仍然可能超配额，白白重试。
+  try {
+    window.localStorage.removeItem(SEARCH_CACHE_KEY);
+  } catch {
+    return;
+  }
+  // 从后往前丢，保证最新一次搜索一定落盘。
+  //
+  // 这里不能像 MessageManagement 那样直接吞掉异常：setItem 抛错时 key 会
+  // 保留旧内容，下次搜索构造同样 5 条、再抛、再保留旧的——用户会看到一个
+  // 永远不更新的标签行，恢复出越来越旧的结果，而且界面上没有任何提示。
+  // 隐私模式下 setItem 每次必抛，循环会一路缩到 0 条退出，此时静默放弃，
+  // 当前会话内的 state 仍然可用。
+  let keep = capped.length;
+  while (keep > 0) {
+    if (writeSearchCache(capped.slice(0, keep))) return;
+    keep -= 1;
+  }
+};
+
+/** 同一组（关键词, 页数, 账号）算同一次搜索。分隔符用 \u0000，
+ *  避免关键词里含分隔符时被拼串撞车（沿用 MessageManagement 的写法）。 */
+const searchCacheKey = (entry: Pick<SearchCacheEntry, 'keyword' | 'totalPages' | 'cookieId'>) =>
+  `${entry.keyword}\u0000${entry.totalPages}\u0000${entry.cookieId}`;
+
+/** 同 key 只保留最新一次；新条目永远排在最前。 */
+const mergeSearchCache = (list: SearchCacheEntry[], entry: SearchCacheEntry): SearchCacheEntry[] => {
+  const key = searchCacheKey(entry);
+  return [entry, ...list.filter((item) => searchCacheKey(item) !== key)]
+    .slice(0, MAX_SEARCH_CACHE_ENTRIES);
+};
+
+/** 标签行上的相对时间。超过一周就不再有意义，退回绝对日期。 */
+const formatRelativeTime = (savedAt: number, now: number = Date.now()): string => {
+  if (!Number.isFinite(savedAt)) return '';
+  const diffMs = now - savedAt;
+  // 系统时钟被回拨时 savedAt 会落在「未来」，别渲染成「-3分钟前」。
+  if (diffMs < 0) return '刚刚';
+  const minutes = Math.floor(diffMs / 60_000);
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes}分钟前`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}小时前`;
+  const days = Math.floor(hours / 24);
+  if (days <= 7) return `${days}天前`;
+  return new Date(savedAt).toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+};
+
 const SearchXianyuTab: React.FC<SearchXianyuTabProps> = ({ accounts, accountNames }) => {
-  const [form, setForm] = useState<SearchFormState>(emptySearchForm);
+  // 挂载时只读一次 localStorage，所有初值都从这一份派生，避免几个 useState
+  // 各读各的、读出不一致的快照。
+  //
+  // 用惰性初始化而不是 useState([]) + useEffect 恢复：结果区的渲染条件是
+  // `results.length > 0 || searching`、空状态是 `!searching && results.length === 0
+  // && !error`，用 effect 的话首帧会先画一次「暂无搜索结果」再被结果替换，每次
+  // 挂载都闪一下。这里首帧就是对的。
+  //
+  // StrictMode 在开发环境会把初始化函数跑两次；这里是纯读、无副作用，安全。
+  // 也因此不要在初始化器里写回 localStorage。
+  const [initialCache] = useState(loadSearchCache);
+  const restored = initialCache[0] ?? null;
+
+  const [form, setForm] = useState<SearchFormState>(() => (restored
+    ? { keyword: restored.keyword, totalPages: String(restored.totalPages), cookieId: restored.cookieId }
+    : emptySearchForm));
+  const [history, setHistory] = useState<SearchCacheEntry[]>(initialCache);
+  const historyRef = useRef(initialCache);
   const [searching, setSearching] = useState(false);
-  const [results, setResults] = useState<XianyuSearchResult[]>([]);
-  const [total, setTotal] = useState(0);
-  const [error, setError] = useState('');
-  const [keyword, setKeyword] = useState('');
+  const [results, setResults] = useState<XianyuSearchResult[]>(() => restored?.results ?? []);
+  const [total, setTotal] = useState(() => restored?.total ?? 0);
+  const [error, setError] = useState(() => restored?.warning ?? '');
+  const [keyword, setKeyword] = useState(() => restored?.keyword ?? '');
+
+  // 每次搜索领一个号。号对不上说明这次结果已经作废（用户点了历史标签，
+  // 或又发起了新搜索）——异步回来的响应不能再往下写。
+  const searchSeqRef = useRef(0);
+
+  /** history 的唯一写入口：state、ref、localStorage 一起更新。
+   *  用 ref 镜像是因为 doSearch 是异步的，闭包里的 history 会是旧快照。 */
+  const commitHistory = (next: SearchCacheEntry[]) => {
+    historyRef.current = next;
+    setHistory(next);
+    saveSearchCache(next);
+  };
+
+  const restoreEntry = (entry: SearchCacheEntry) => {
+    // 作废仍在飞行中的搜索：它回来时 seq 对不上，不会再覆盖刚恢复的结果。
+    searchSeqRef.current += 1;
+    setSearching(false);
+    setError(entry.warning ?? '');
+    setResults(entry.results);
+    setTotal(entry.total);
+    setKeyword(entry.keyword);
+    setForm({
+      keyword: entry.keyword,
+      totalPages: String(entry.totalPages),
+      cookieId: entry.cookieId,
+    });
+    // 刻意不刷新 savedAt：那会让标签行每次点击都重排序，还会把一条老数据
+    // 标成「刚刚」——数据不是刚拿到的，那是假的。
+  };
 
   const doSearch = async () => {
-    if (!form.keyword.trim()) { notify('请输入搜索关键词', 'warning'); return; }
+    const trimmedKeyword = form.keyword.trim();
+    if (!trimmedKeyword) { notify('请输入搜索关键词', 'warning'); return; }
+    const seq = searchSeqRef.current + 1;
+    searchSeqRef.current = seq;
     setSearching(true);
     setError('');
     setResults([]);
     setTotal(0);
-    setKeyword(form.keyword);
+    // 用 trim 过的串：标题和 CSV 文件名都取自它，不能带上用户的空格。
+    setKeyword(trimmedKeyword);
     try {
       const pages = parseInt(form.totalPages) || 1;
       const resp = pages > 1
-        ? await searchXianyuItemsMultiple(form.keyword.trim(), pages)
-        : await searchXianyuItems(form.keyword.trim(), 1, 20);
+        ? await searchXianyuItemsMultiple(trimmedKeyword, pages)
+        : await searchXianyuItems(trimmedKeyword, 1, 20);
+      if (seq !== searchSeqRef.current) return;  // 已被「恢复历史」作废
       if (resp.success) {
-        setResults(resp.data || []);
-        setTotal(resp.total || 0);
+        const data = resp.data || [];
+        const nextTotal = resp.total || 0;
+        setResults(data);
+        setTotal(nextTotal);
         if (resp.error) setError(resp.error);
+
+        // 搜到 0 条也缓存：缓存该还原真实的上次状态，而不是挑好看的。
+        // 跳过的话，重启后会自动恢复成「再上一次」的搜索，具有误导性。
+        const entry: SearchCacheEntry = {
+          savedAt: Date.now(),
+          keyword: trimmedKeyword,
+          totalPages: pages,
+          cookieId: form.cookieId,
+          total: nextTotal,
+          warning: resp.error || undefined,
+          results: data,
+        };
+        commitHistory(mergeSearchCache(historyRef.current, entry));
       } else {
         setError(resp.error || '搜索失败');
       }
     } catch (e) {
+      if (seq !== searchSeqRef.current) return;
       setError((e as Error).message);
     } finally {
-      setSearching(false);
+      // 也要判 seq：否则先发的搜索会把后发搜索的转圈关掉。
+      if (seq === searchSeqRef.current) setSearching(false);
     }
+  };
+
+  const removeEntry = (entry: SearchCacheEntry) => {
+    commitHistory(historyRef.current.filter(
+      (item) => searchCacheKey(item) !== searchCacheKey(entry),
+    ));
+  };
+
+  const clearHistory = () => {
+    if (historyRef.current.length === 0) return;
+    commitHistory([]);
+    notify('已清空搜索历史', 'success');
   };
 
   const copyToClipboard = (text: string) => {
@@ -1240,6 +1454,13 @@ const SearchXianyuTab: React.FC<SearchXianyuTabProps> = ({ accounts, accountName
                 className="ios-input mt-1.5 w-full rounded-md px-3 py-2.5 text-sm"
               >
                 <option value="">自动选择</option>
+                {/* accounts 是父组件异步取的，首帧通常是空的，所以没法规校缓存里的
+                    cookieId。恢复一条已被删账号的历史时，select 的 value 找不到对应
+                    option 会显示成「自动选择」，但 state 里其实是个幽灵值。补一个
+                    占位 option 既让状态可见，也告诉用户为什么。 */}
+                {form.cookieId && !accounts.some((a) => a.id === form.cookieId) && (
+                  <option value={form.cookieId}>（账号已失效）</option>
+                )}
                 {accounts.map((a) => (
                   <option key={a.id} value={a.id}>{accountNames.get(a.id) || a.id}</option>
                 ))}
@@ -1257,6 +1478,49 @@ const SearchXianyuTab: React.FC<SearchXianyuTabProps> = ({ accounts, accountName
           </div>
           {error && (
             <div className="mt-3 rounded-md bg-red-50 px-4 py-2 text-sm text-red-600">{error}</div>
+          )}
+          {/* 放在表单面板里而不是结果面板旁边：结果面板是条件渲染的，而这一行
+              必须在本次会话还没搜过时就可见——那正是恢复的意义。 */}
+          {history.length > 0 && (
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <span className="text-xs font-bold text-gray-500">最近搜索</span>
+              {history.map((entry) => (
+                <span
+                  key={searchCacheKey(entry)}
+                  className="inline-flex max-w-full items-center gap-1 rounded bg-gray-100 px-2 py-1 text-xs text-gray-600"
+                >
+                  {/* 「恢复」和「删除」必须是兄弟 button：button 套 button 是非法
+                      HTML，键盘和读屏都会坏。 */}
+                  <button
+                    type="button"
+                    onClick={() => restoreEntry(entry)}
+                    title={`恢复「${entry.keyword}」的搜索结果（共 ${entry.total} 件）`}
+                    className="flex min-w-0 items-center gap-1 rounded px-0.5 hover:bg-gray-200"
+                  >
+                    {/* truncate 只加在关键词上，不加在 button 上：否则时间要一起被截掉 */}
+                    <span className="max-w-40 truncate font-medium text-gray-700">{entry.keyword}</span>
+                    <span className="shrink-0 text-gray-400">
+                      {formatRelativeTime(entry.savedAt)} · {entry.results.length}件
+                    </span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => removeEntry(entry)}
+                    title={`删除「${entry.keyword}」的搜索缓存`}
+                    className="shrink-0 rounded p-0.5 hover:bg-gray-200"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </span>
+              ))}
+              <button
+                type="button"
+                onClick={clearHistory}
+                className="ml-1 text-xs text-gray-400 underline-offset-2 hover:text-gray-600 hover:underline"
+              >
+                清空
+              </button>
+            </div>
           )}
         </div>
       </div>

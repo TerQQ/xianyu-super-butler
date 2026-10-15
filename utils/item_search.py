@@ -5,6 +5,8 @@
 """
 
 import asyncio
+import functools
+import inspect
 import sys
 import os
 import re
@@ -36,12 +38,28 @@ if os.getenv('DOCKER_ENV'):
     except Exception as e:
         logger.warning(f"设置SelectorEventLoop失败: {e}")
 
+# Patchright 是 Playwright 的反检测分支，从底层抹掉 CDP 留下的自动化痕迹，
+# 比事后再注入 JS 更彻底。但 import 成功不等于能用：它自带一套浏览器构建
+# （要 `patchright install chromium`），本机和 Dockerfile 都只装了官方
+# Playwright 那套，所以它随时可能起不来。官方 Playwright 一并导入好兜底。
+try:
+    from patchright.async_api import async_playwright as patchright_async_playwright
+    PATCHRIGHT_AVAILABLE = True
+except ImportError:
+    patchright_async_playwright = None
+    PATCHRIGHT_AVAILABLE = False
+
 try:
     from playwright.async_api import async_playwright
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
+    async_playwright = None
     PLAYWRIGHT_AVAILABLE = False
     logger.warning("Playwright 未安装，将使用模拟数据")
+
+# 上次尝试用 Patchright 起浏览器是否失败过。失败后置 True，后续搜索直接走官方
+# Playwright——否则每次搜索都要先撞一次 "Executable doesn't exist" 才回退。
+_patchright_broken = False
 
 
 # --- 浏览器 profile 目录池 ---------------------------------------------------
@@ -222,6 +240,49 @@ def acquire_profile_dir():
         "可能有一批搜索卡住没释放"
     )
     return None, None
+
+
+# 商品搜索这条路径原先没有任何反自动化措施：无头、navigator.webdriver 为 true、
+# 启动参数里也没有关闭自动化特性标记，等于把"我是机器人"写在脸上。滑块那条路径
+# 早就处理过这些，这里补齐。
+#
+# 只做两件事，且都是"抹掉痕迹"而不是"伪造特征"：
+# - navigator.webdriver 置 undefined，并清掉原型链上的同名属性；
+# - 清掉 Playwright / CDP 挂在 window 上的全局对象。
+#
+# 刻意不做 canvas / WebGL / 字体 / UA 伪装：滑块那边试过一整套（原本 17.5KB 的
+# 脚本），因为造出的指纹自相矛盾反而更容易被识破，最后删掉了。这里不重蹈覆辙。
+# 见 utils/xianyu_slider_stealth.py 里对应的删除说明。
+_STEALTH_SCRIPT = """
+    try {
+        Object.defineProperty(navigator, 'webdriver', {
+            get: () => undefined,
+            configurable: true
+        });
+        delete Object.getPrototypeOf(navigator).webdriver;
+    } catch (e) {}
+    try {
+        delete window.playwright;
+        delete window.__playwright;
+        delete window.__pw_manual;
+        delete window.__PW_inspect;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+        delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+    } catch (e) {}
+"""
+
+
+async def _install_stealth(context) -> None:
+    """给上下文注入反自动化脚本。必须在 new_page() 之前调用。
+
+    注入失败不算致命——Patchright 本身已经把大部分痕迹处理掉了，这里更多是
+    在回退到官方 Playwright 时兜底，所以只记日志不上抛。
+    """
+    try:
+        await context.add_init_script(_STEALTH_SCRIPT)
+    except Exception as e:
+        logger.warning(f"注入反自动化脚本失败（不影响搜索，但特征面更大）: {e}")
 
 
 class XianyuSearcher:
@@ -896,6 +957,8 @@ class XianyuSearcher:
 
     async def init_browser(self):
         """初始化浏览器（使用持久化上下文，保留缓存和cookies）"""
+        global _patchright_broken
+
         if not PLAYWRIGHT_AVAILABLE:
             raise Exception("Playwright 未安装，无法使用真实搜索功能")
 
@@ -906,7 +969,13 @@ class XianyuSearcher:
                 await asyncio.to_thread(browser_limit.acquire_slot, "商品搜索")
                 self._browser_slot_held = True
 
-            playwright = await async_playwright().start()
+            # 先按 Patchright 起。它能不能真的用，要等 launch 才知道（自带构建
+            # 缺失时 import 依然成功），所以失败的处理在下面 launch 那层。
+            use_patchright = PATCHRIGHT_AVAILABLE and not _patchright_broken
+            if use_patchright:
+                playwright = await patchright_async_playwright().start()
+            else:
+                playwright = await async_playwright().start()
 
             # 复用一个固定槽位的 profile 目录，而不是每次搜索都新建：全新目录
             # 等于一个没有历史的浏览器身份，对风控来说反而更可疑。超过
@@ -931,6 +1000,9 @@ class XianyuSearcher:
                 '--disable-extensions',
                 '--disable-default-apps',
                 '--no-default-browser-check',
+                # 不启用 Blink 的自动化特性标记，去掉 navigator.webdriver 等痕迹。
+                # 滑块路径一直是这么配的，商品搜索这边原先漏了。
+                '--disable-blink-features=AutomationControlled',
                 # 中文语言设置
                 '--lang=zh-CN',
                 '--accept-lang=zh-CN,zh,en-US,en'
@@ -944,34 +1016,57 @@ class XianyuSearcher:
                     # '--single-process'  # 注释掉，避免崩溃
                 ])
 
-            logger.info("正在启动浏览器（中文模式，持久化缓存）...")
-            
+            logger.info(
+                f"正在启动浏览器（中文模式，持久化缓存，"
+                f"{'Patchright' if use_patchright else 'Playwright'}）..."
+            )
+
+            # 这里刻意不用 channel='chrome'（系统正式版 Chrome）。滑块路径改用它是
+            # 因为滑块页面会读深层指纹；但搜索这边我们显式传了 user_agent=CHROME_UA
+            # （版本写死在 user_agents.py），而系统 Chrome 的实际版本往往不同，浏览器
+            # 自己发的 Sec-CH-UA 就会和这个 UA 对不上。user_agents.py 开头写明：UA 与
+            # sec-ch-ua 的版本分裂会触发 RRXVv_ERROR「验证通过但请求被拒」（issue #62）。
+            # 要换正式版 Chrome，得先把 CHROME_MAJOR 和滑块那边的 UA 一起对齐。
+
             # 使用 launch_persistent_context 实现跨会话的缓存持久化
             # 这样通过一次滑块验证后，下次搜索可以复用缓存，避免再次出现滑块
+            # 持久化上下文会自动保存和加载：
+            # - Cookies / 缓存 / LocalStorage / SessionStorage / 其他浏览器状态
+            launch_kwargs = dict(
+                headless=True,  # 无头模式，后台运行
+                args=browser_args,
+                user_agent=CHROME_UA,
+                viewport={'width': 1280, 'height': 720},
+                locale='zh-CN',  # 设置语言为中文
+            )
+
             try:
                 self.context = await playwright.chromium.launch_persistent_context(
-                    user_data_dir,  # 第一个参数是用户数据目录，用于持久化
-                    headless=True,  # 无头模式，后台运行
-                    args=browser_args,
-                    user_agent=CHROME_UA,
-                    viewport={'width': 1280, 'height': 720},
-                    locale='zh-CN',  # 设置语言为中文
-                    # 持久化上下文会自动保存和加载：
-                    # - Cookies
-                    # - 缓存
-                    # - LocalStorage
-                    # - SessionStorage
-                    # - 其他浏览器状态
+                    user_data_dir, **launch_kwargs
                 )
-            except Exception:
-                # 启动失败就别攥着槽位和租约，否则后面的搜索全在排队等
-                if self._profile_lease is not None:
-                    self._profile_lease.release()
-                    self._profile_lease = None
-                if self._browser_slot_held:
-                    self._browser_slot_held = False
-                    browser_limit.release_slot("商品搜索")
-                raise
+            except Exception as e:
+                if not use_patchright:
+                    self._release_browser_resources()
+                    raise
+                # Patchright 缺自己那套浏览器构建时报 "Executable doesn't exist"。
+                # 换官方 Playwright 重试——反自动化仍由上面的启动参数和
+                # _install_stealth 兜底，只是少一层内核级掩护。记下来，省得
+                # 之后每次搜索都先撞一次同样的错。
+                _patchright_broken = True
+                logger.warning(
+                    f"Patchright 起不来（{e}），回退官方 Playwright。"
+                    f"想要内核级反检测可执行 `patchright install chromium`"
+                )
+                await playwright.stop()
+                playwright = await async_playwright().start()
+                try:
+                    self.context = await playwright.chromium.launch_persistent_context(
+                        user_data_dir, **launch_kwargs
+                    )
+                except Exception:
+                    # 重试也失败就别攥着槽位和租约，否则后面的搜索全在排队等
+                    self._release_browser_resources()
+                    raise
 
             # launch_persistent_context 返回的是 context，不是 browser
             # 需要通过 context.browser 获取 browser 对象
@@ -979,10 +1074,22 @@ class XianyuSearcher:
 
             logger.info("浏览器启动成功（持久化上下文已创建）...")
 
+            # 必须在 new_page() 之前注入，否则脚本赶不上第一个页面
+            await _install_stealth(self.context)
+
             logger.info("创建页面...")
             self.page = await self.context.new_page()
 
             logger.info("浏览器初始化完成（缓存将持久化保存）")
+
+    def _release_browser_resources(self) -> None:
+        """启动失败时把浏览器槽位和 profile 租约还回去，否则后面的搜索全在排队等。"""
+        if self._profile_lease is not None:
+            self._profile_lease.release()
+            self._profile_lease = None
+        if self._browser_slot_held:
+            self._browser_slot_held = False
+            browser_limit.release_slot("商品搜索")
 
     async def close_browser(self):
         """关闭浏览器（持久化上下文会自动保存缓存和cookies）"""
@@ -1822,6 +1929,95 @@ class XianyuSearcher:
 
 # 搜索器工具函数
 
+
+def _emit_search_summary(
+    mode: str,
+    keyword: str,
+    pages: Any,
+    total: int,
+    risk_blocked: bool,
+    elapsed: float,
+    error: Optional[str],
+) -> None:
+    """每次搜索结束打一行小结。
+
+    存在的理由：判断滑块概率要靠"一段时间里多少次搜索被拦"，而这 12000 行
+    日志里混满了 SQL 和诊断输出，事后只能手工翻比对。固定前缀「搜索小结」
+    就是为了 `grep 搜索小结` 能一次拿到完整趋势。
+
+    注意 items=0 且没报错也单独算一档：那种情况代码里是按"疑似静默滑块"
+    处理的（见 search_xianyu_items 里的重试分支），不是正常空结果。
+    """
+    # 风控优先于 error 判断：被拦截时 result 里那条 error 本身就是"被风控拦了"
+    # 的说明文案，报成"失败"会让人以为是代码问题。
+    if risk_blocked:
+        verdict = '风控拦截'
+    elif error:
+        verdict = '失败'
+    elif total == 0:
+        verdict = '空结果(疑似静默拦截)'
+    else:
+        verdict = '正常'
+
+    logger.info(
+        f"🔎 搜索小结 | {mode} | 关键词={keyword!r} | 页数={pages} | 条数={total} | "
+        f"风控拦截={risk_blocked} | 耗时={elapsed:.1f}s | 结论={verdict}"
+    )
+
+
+def _log_search_outcome(mode: str, pages_param: str):
+    """给搜索入口套一层，保证不管从哪个 return / 异常分支出去都留下小结。
+
+    每个入口内部都有好几条出口（成功、重试耗尽、风控兜底…），逐个加日志
+    迟早漏一个。这里统一在出口处收口。
+    """
+    def decorator(fn):
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            sig = None
+
+        def _pages(args, kwargs, default=1):
+            """页数参数按位置还是关键字传的都要能取到。"""
+            if sig is not None:
+                try:
+                    bound = sig.bind_partial(*args, **kwargs)
+                    return bound.arguments.get(pages_param, default)
+                except TypeError:
+                    pass
+            return kwargs.get(pages_param, default)
+
+        @functools.wraps(fn)
+        async def wrapper(*args, **kwargs):
+            # 入口的第一个参数都是 keyword，绑定时占位用的 None 对应它
+            keyword = args[0] if args else kwargs.get('keyword', '')
+            start = time.time()
+            try:
+                result = await fn(*args, **kwargs)
+            except Exception as e:
+                _emit_search_summary(
+                    mode, keyword, _pages(args, kwargs), 0, False,
+                    time.time() - start, str(e),
+                )
+                raise
+
+            items = (result or {}).get('items') or []
+            _emit_search_summary(
+                mode,
+                keyword,
+                _pages(args, kwargs),
+                len(items),
+                bool((result or {}).get('is_risk_blocked')),
+                time.time() - start,
+                (result or {}).get('error'),
+            )
+            return result
+
+        return wrapper
+    return decorator
+
+
+@_log_search_outcome('单页', 'page')
 async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) -> Dict[str, Any]:
     """
     搜索闲鱼商品的便捷函数，带重试机制
@@ -1911,6 +2107,7 @@ async def search_xianyu_items(keyword: str, page: int = 1, page_size: int = 20) 
     }
 
 
+@_log_search_outcome('多页', 'total_pages')
 async def search_multiple_pages_xianyu(keyword: str, total_pages: int = 1) -> Dict[str, Any]:
     """
     搜索多页闲鱼商品的便捷函数，带重试机制
